@@ -32,24 +32,36 @@ actor EppoClientState {
 
 public class EppoClient {
     public typealias AssignmentLogger = (Assignment) -> Void
-    
-    private static var sharedInstance: EppoClient?
-    private static let initializerQueue = DispatchQueue(label: "com.eppo.client.initializer")
-    
+
     private var flagEvaluator: FlagEvaluator = FlagEvaluator(sharder: MD5Sharder())
-    private(set) var isConfigObfuscated = true;
-    
+
+    public var isConfigObfuscated = true
+
     private(set) var sdkKey: String
     private(set) var host: String
     private(set) var assignmentLogger: AssignmentLogger?
     private(set) var assignmentCache: AssignmentCache?
     private(set) var configurationStore: ConfigurationStore
-    
-    private let state = EppoClientState()
-    
-    private init(
+
+    private let queue = DispatchQueue(label: "com.eppo.client.EppoClient", attributes: .concurrent)
+
+    private var _hasLoaded = false
+    private var hasLoaded: Bool {
+        get {
+            queue.sync {
+                self._hasLoaded
+            }
+        }
+        set {
+            queue.async(flags: .barrier) {
+                self._hasLoaded = newValue
+            }
+        }
+    }
+
+    public init(
         sdkKey: String,
-        host: String,
+        host: String = "https://fscdn.eppo.cloud",
         assignmentLogger: AssignmentLogger? = nil,
         assignmentCache: AssignmentCache? = InMemoryAssignmentCache()
     ) {
@@ -57,205 +69,167 @@ public class EppoClient {
         self.host = host
         self.assignmentLogger = assignmentLogger
         self.assignmentCache = assignmentCache
-        
+
         let httpClient = NetworkEppoHttpClient(baseURL: host, sdkKey: sdkKey, sdkName: "sdkName", sdkVersion: sdkVersion)
         let configurationRequester = ConfigurationRequester(httpClient: httpClient)
         self.configurationStore = ConfigurationStore(requester: configurationRequester)
     }
-    
-    public static func initialize(
-        sdkKey: String,
-        host: String = "https://fscdn.eppo.cloud",
-        assignmentLogger: AssignmentLogger? = nil,
-        assignmentCache: AssignmentCache? = InMemoryAssignmentCache()
-    ) async throws -> EppoClient {
-        return try await withCheckedThrowingContinuation { continuation in
-            initializerQueue.async(flags: .barrier) {
-                if sharedInstance == nil {
-                    sharedInstance = EppoClient(
-                        sdkKey: sdkKey,
-                        host: host,
-                        assignmentLogger: assignmentLogger,
-                        assignmentCache: assignmentCache
-                    )
-                    Task {
-                        do {
-                            try await sharedInstance!.loadIfNeeded()
-                            continuation.resume(returning: sharedInstance!)
-                        } catch {
-                            continuation.resume(throwing: error)
-                        }
-                    }
-                } else {
-                    continuation.resume(returning: sharedInstance!)
-                }
-            }
+
+    // Note: this *must* be called before getting any assignments, otherwise an error will
+    // be thrown
+    public func load(force: Bool = false) async throws {
+        guard !hasLoaded || force else {
+            return
+        }
+
+        // Prevent multiple subsequent calls, optimistically assuming the fetch will succeed
+        hasLoaded = true
+
+        do {
+            try await configurationStore.fetchAndStoreConfigurations()
+        } catch {
+            hasLoaded = false
+            throw error
         }
     }
-    
-    public static func shared() throws -> EppoClient {
-        guard let instance = sharedInstance else {
-            throw Errors.notConfigured
-        }
-        return instance
+
+    public func getAssignment(
+        flagKey: String,
+        subjectKey: String,
+        subjectAttributes: SubjectAttributes = SubjectAttributes()) throws -> String?
+    {
+        return try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes
+        )?.variation?.value.getStringValue()
     }
-    
-    public static func resetSharedInstance() {
-        sharedInstance = nil
-    }
-    
-    private func loadIfNeeded() async throws {
-        let alreadyLoaded = await state.checkAndSetLoaded()
-        guard !alreadyLoaded else { return }
-        
-        try await self.configurationStore.fetchAndStoreConfigurations()
-    }
-    
-    public func setConfigObfuscation(obfuscated: Bool) {
-        self.isConfigObfuscated = obfuscated
-    }
-    
+
     public func getBooleanAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes = SubjectAttributes(),
         defaultValue: Bool) throws -> Bool
     {
-        do {
-            return try getInternalAssignment(
-                flagKey: flagKey,
-                subjectKey: subjectKey,
-                subjectAttributes: subjectAttributes,
-                expectedVariationType: UFC_VariationType.boolean
-            )?.variation?.value.getBoolValue() ?? defaultValue
-        } catch {
-            // todo: implement graceful mode
-            return defaultValue
-        }
+        return try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes,
+            expectedVariationType: UFC_VariationType.boolean
+        )?.variation?.value.getBoolValue() ?? defaultValue
     }
-    
+
     public func getJSONStringAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes,
         defaultValue: String) throws -> String
     {
-        do {
-            return try getInternalAssignment(
-                flagKey: flagKey,
-                subjectKey: subjectKey,
-                subjectAttributes: subjectAttributes,
-                expectedVariationType: UFC_VariationType.json
-            )?.variation?.value.getStringValue() ?? defaultValue
-        } catch {
-            // todo: implement graceful mode
-            return defaultValue
-        }
+        return try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes,
+            expectedVariationType: UFC_VariationType.json
+        )?.variation?.value.getStringValue() ?? defaultValue
     }
-    
+
     public func getIntegerAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes = SubjectAttributes(),
         defaultValue: Int) throws -> Int
     {
-        do {
-            let assignment = try getInternalAssignment(
-                flagKey: flagKey,
-                subjectKey: subjectKey,
-                subjectAttributes: subjectAttributes,
-                expectedVariationType: UFC_VariationType.integer
-            )
-            return Int(try assignment?.variation?.value.getDoubleValue() ?? Double(defaultValue))
-        } catch {
-            // todo: implement graceful mode
-            return defaultValue
-        }
+        let assignment = try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes,
+            expectedVariationType: UFC_VariationType.integer
+        )
+
+        return Int(try assignment?.variation?.value.getDoubleValue() ?? Double(defaultValue))
     }
-    
+
     public func getNumericAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes = SubjectAttributes(),
         defaultValue: Double) throws -> Double
     {
-        do {
-            return try getInternalAssignment(
-                flagKey: flagKey,
-                subjectKey: subjectKey,
-                subjectAttributes: subjectAttributes,
-                expectedVariationType: UFC_VariationType.numeric
-            )?.variation?.value.getDoubleValue() ?? defaultValue
-        } catch {
-            // todo: implement graceful mode
-            return defaultValue
-        }
+        return try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes,
+            expectedVariationType: UFC_VariationType.numeric
+        )?.variation?.value.getDoubleValue() ?? defaultValue
     }
-    
+
     public func getStringAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes = SubjectAttributes(),
         defaultValue: String) throws -> String
     {
-        do {
-            return try getInternalAssignment(
-                flagKey: flagKey,
-                subjectKey: subjectKey,
-                subjectAttributes: subjectAttributes,
-                expectedVariationType: UFC_VariationType.string
-            )?.variation?.value.getStringValue() ?? defaultValue
-        } catch {
-            // todo: implement graceful mode
-            return defaultValue
-        }
+        return try getInternalAssignment(
+            flagKey: flagKey,
+            subjectKey: subjectKey,
+            subjectAttributes: subjectAttributes,
+            expectedVariationType: UFC_VariationType.string
+        )?.variation?.value.getStringValue() ?? defaultValue
     }
-    
+
     private func getInternalAssignment(
         flagKey: String,
         subjectKey: String,
         subjectAttributes: SubjectAttributes,
-        expectedVariationType: UFC_VariationType) throws -> FlagEvaluation?
+        expectedVariationType: UFC_VariationType? = nil) throws -> FlagEvaluation?
     {
-        if (self.sdkKey.count == 0) {
-            throw Errors.sdkKeyInvalid;
+        guard hasLoaded else {
+            throw Errors.configurationNotLoaded
         }
-        
-        if (self.host.count == 0) {
-            throw Errors.hostInvalid;
+
+        guard !sdkKey.isEmpty else {
+            throw Errors.sdkKeyInvalid
         }
-        
-        if subjectKey.count == 0 { throw Errors.subjectKeyRequired }
-        if flagKey.count == 0 { throw Errors.flagKeyRequired }
-        if !self.configurationStore.isInitialized() { throw Errors.configurationNotLoaded }
-        
+
+        guard !host.isEmpty else {
+            throw Errors.hostInvalid
+        }
+
+        guard !subjectKey.isEmpty else {
+            throw Errors.subjectKeyRequired
+        }
+
+        guard !flagKey.isEmpty else {
+            throw Errors.flagKeyRequired
+        }
+
         let flagKeyForLookup = isConfigObfuscated ? getMD5Hex(flagKey) : flagKey
-        
+
         guard let flagConfig = self.configurationStore.getConfiguration(flagKey: flagKeyForLookup) else {
             throw Errors.flagConfigNotFound
         }
-        
-        if flagConfig.variationType != expectedVariationType {
+
+        guard flagConfig.variationType == expectedVariationType else {
             throw Errors.variationTypeMismatch
         }
-        
+
         let flagEvaluation = flagEvaluator.evaluateFlag(
             flag: flagConfig,
             subjectKey: subjectKey,
             subjectAttributes: subjectAttributes,
             isConfigObfuscated: isConfigObfuscated
         )
-        
-        if let variation = flagEvaluation.variation, !isValueOfType(expectedType: expectedVariationType, variationValue: variation.value) {
+
+        if let variation = flagEvaluation.variation, let expectedVariationType, !variation.value.isOfType(expectedVariationType) {
             throw Errors.variationWrongType
         }
-        
+
         // Optionally log assignment
         if flagEvaluation.doLog {
-            if let assignmentLogger = self.assignmentLogger {
+            if let assignmentLogger {
                 let allocationKey = flagEvaluation.allocationKey ?? "__eppo_no_allocation"
                 let variationKey = flagEvaluation.variation?.key ?? "__eppo_no_variation"
-                
+
                 // Prepare the assignment cache key
                 let assignmentCacheKey = AssignmentCacheKey(
                     subjectKey: subjectKey,
@@ -263,7 +237,7 @@ public class EppoClient {
                     allocationKey: allocationKey,
                     variationKey: variationKey
                 )
-                
+
                 // Check if the assignment has already been logged, if the cache is defined
                 if let cache = self.assignmentCache, cache.hasLoggedAssignment(key: assignmentCacheKey) {
                     // The assignment has already been logged, do nothing
@@ -284,27 +258,29 @@ public class EppoClient {
                         ],
                         extraLogging: flagEvaluation.extraLogging
                     )
-                    
+
                     assignmentLogger(assignment)
                     self.assignmentCache?.setLastLoggedAssignment(key: assignmentCacheKey)
                 }
             }
         }
-        
-        return flagEvaluation;
+
+        return flagEvaluation
     }
 }
 
-func isValueOfType(expectedType: UFC_VariationType, variationValue: EppoValue) -> Bool {
-    switch expectedType {
-    case .json, .string:
-        return variationValue.isString()
-    case .integer:
-        let doubleValue = try? variationValue.getDoubleValue()
-        return variationValue.isNumeric() && doubleValue != nil && floor(doubleValue!) == doubleValue!
-    case .numeric:
-        return variationValue.isNumeric()
-    case .boolean:
-        return variationValue.isBool()
+private extension EppoValue {
+    func isOfType(_ expectedType: UFC_VariationType) -> Bool {
+        switch expectedType {
+        case .json, .string:
+            return self.isString()
+        case .integer:
+            let doubleValue = try? self.getDoubleValue()
+            return self.isNumeric() && doubleValue != nil && floor(doubleValue!) == doubleValue!
+        case .numeric:
+            return self.isNumeric()
+        case .boolean:
+            return self.isBool()
+        }
     }
 }
