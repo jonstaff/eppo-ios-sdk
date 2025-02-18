@@ -224,44 +224,41 @@ public class EppoClient {
             throw Errors.variationWrongType
         }
 
-        // Optionally log assignment
-        if flagEvaluation.doLog {
-            if let assignmentLogger {
-                let allocationKey = flagEvaluation.allocationKey ?? "__eppo_no_allocation"
-                let variationKey = flagEvaluation.variation?.key ?? "__eppo_no_variation"
+        if let assignmentLogger {
+            let allocationKey = flagEvaluation.allocationKey ?? "__eppo_no_allocation"
+            let variationKey = flagEvaluation.variation?.key ?? "__eppo_no_variation"
 
-                // Prepare the assignment cache key
-                let assignmentCacheKey = AssignmentCacheKey(
-                    subjectKey: subjectKey,
+            // Prepare the assignment cache key
+            let assignmentCacheKey = AssignmentCacheKey(
+                subjectKey: subjectKey,
+                flagKey: flagKey,
+                allocationKey: allocationKey,
+                variationKey: variationKey
+            )
+
+            // Check if the assignment has already been logged, if the cache is defined
+            if let cache = assignmentCache, cache.hasLoggedAssignment(key: assignmentCacheKey) {
+                // The assignment has already been logged, do nothing
+            } else {
+                // Either the cache is not defined, or the assignment hasn't been logged yet
+                // Perform assignment.
+                let assignment = Assignment(
                     flagKey: flagKey,
                     allocationKey: allocationKey,
-                    variationKey: variationKey
+                    variation: variationKey,
+                    subject: subjectKey,
+                    timestamp: ISO8601DateFormatter().string(from: Date()),
+                    subjectAttributes: subjectAttributes,
+                    metaData: [
+                        "obfuscated": String(isConfigObfuscated),
+                        "sdkName": sdkName,
+                        "sdkVersion": sdkVersion
+                    ],
+                    extraLogging: flagEvaluation.extraLogging
                 )
 
-                // Check if the assignment has already been logged, if the cache is defined
-                if let cache = self.assignmentCache, cache.hasLoggedAssignment(key: assignmentCacheKey) {
-                    // The assignment has already been logged, do nothing
-                } else {
-                    // Either the cache is not defined, or the assignment hasn't been logged yet
-                    // Perform assignment.
-                    let assignment = Assignment(
-                        flagKey: flagKey,
-                        allocationKey: allocationKey,
-                        variation: variationKey,
-                        subject: subjectKey,
-                        timestamp: ISO8601DateFormatter().string(from: Date()),
-                        subjectAttributes: subjectAttributes,
-                        metaData: [
-                            "obfuscated": String(isConfigObfuscated),
-                            "sdkName": sdkName,
-                            "sdkVersion": sdkVersion
-                        ],
-                        extraLogging: flagEvaluation.extraLogging
-                    )
-
-                    assignmentLogger(assignment)
-                    self.assignmentCache?.setLastLoggedAssignment(key: assignmentCacheKey)
-                }
+                assignmentLogger(assignment)
+                assignmentCache?.setLastLoggedAssignment(key: assignmentCacheKey)
             }
         }
 
